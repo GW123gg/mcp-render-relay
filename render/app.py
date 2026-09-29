@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Response
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Response, Request
 import os
 import json
 import asyncio
@@ -22,6 +22,7 @@ async def health():
 
 @app.websocket("/agent")
 async def agent(ws: WebSocket):
+
     global agent_connection
 
     auth = ws.headers.get("authorization")
@@ -37,10 +38,17 @@ async def agent(ws: WebSocket):
 
     try:
         while True:
-            data = json.loads(await ws.receive_text())
+
+            data = json.loads(
+                await ws.receive_text()
+            )
 
             if data.get("type") == "response":
-                future = pending.get(data.get("id"))
+
+                future = pending.get(
+                    data.get("id")
+                )
+
                 if future:
                     future.set_result(data)
 
@@ -48,33 +56,73 @@ async def agent(ws: WebSocket):
         print("Agent disconnected")
 
     finally:
+
         if agent_connection == ws:
             agent_connection = None
 
 
+
 @app.post("/mcp")
-async def mcp_forward(payload: dict):
+async def mcp_forward(
+    request: Request,
+    payload: dict
+):
 
     if agent_connection is None:
-        raise HTTPException(503, "Agent offline")
+        raise HTTPException(
+            status_code=503,
+            detail="Agent offline"
+        )
+
 
     request_id = str(uuid.uuid4())
 
     future = asyncio.get_event_loop().create_future()
+
     pending[request_id] = future
 
-    await agent_connection.send_text(json.dumps({
-        "type": "request",
-        "id": request_id,
-        "payload": payload
-    }))
+
+    incoming_headers = {
+        "mcp-session-id":
+            request.headers.get(
+                "mcp-session-id"
+            ),
+        "content-type":
+            request.headers.get(
+                "content-type"
+            )
+    }
+
+
+    await agent_connection.send_text(
+        json.dumps(
+            {
+                "type":"request",
+                "id":request_id,
+                "payload":payload,
+                "headers":incoming_headers
+            }
+        )
+    )
+
 
     try:
-        result = await asyncio.wait_for(future, 120)
+
+        result = await asyncio.wait_for(
+            future,
+            timeout=120
+        )
+
 
         return Response(
-            content=result.get("body", ""),
-            headers=result.get("headers", {}),
+            content=result.get(
+                "body",
+                ""
+            ),
+            headers=result.get(
+                "headers",
+                {}
+            ),
             media_type=result.get(
                 "headers",
                 {}
@@ -85,4 +133,8 @@ async def mcp_forward(payload: dict):
         )
 
     finally:
-        pending.pop(request_id, None)
+
+        pending.pop(
+            request_id,
+            None
+        )
