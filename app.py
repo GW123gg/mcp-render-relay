@@ -1,262 +1,114 @@
-from fastapi import (
-    FastAPI,
-    WebSocket,
-    WebSocketDisconnect,
-    HTTPException,
-)
-
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 import os
 import json
+import asyncio
+import uuid
 import time
-
 
 app = FastAPI()
 
+TOKEN = os.getenv("RELAY_AGENT_TOKEN", "")
 
-# ============================
-# Configuration
-# ============================
+agent_connection = None
 
-RELAY_TOKEN = os.getenv(
-    "RELAY_AGENT_TOKEN",
-    ""
-)
-
-
-# 현재 연결된 Agent
-agent_connection: WebSocket | None = None
-
-
-# 마지막 heartbeat
-last_heartbeat = None
-
-
-
-# ============================
-# Basic HTTP
-# ============================
+pending = {}
 
 
 @app.get("/")
 async def root():
-
     return {
         "service": "MCP Relay",
-        "status": "online",
-        "agent_connected":
-            agent_connection is not None
+        "agent_connected": agent_connection is not None
     }
-
 
 
 @app.get("/health")
 async def health():
-
     return {
         "status": "ok",
-
-        "agent_connected":
-            agent_connection is not None,
-
-        "last_heartbeat":
-            last_heartbeat
+        "agent_connected": agent_connection is not None
     }
 
 
-
-# ============================
-# Agent WebSocket
-# ============================
-
-
 @app.websocket("/agent")
-async def agent_socket(
-    websocket: WebSocket
-):
+async def agent(ws: WebSocket):
 
     global agent_connection
-    global last_heartbeat
 
+    auth = ws.headers.get("authorization")
 
-    # -------------------------
-    # Token Check
-    # -------------------------
+    if TOKEN and auth != f"Bearer {TOKEN}":
+        await ws.close(code=1008)
+        return
 
-    auth = websocket.headers.get(
-        "authorization"
-    )
+    await ws.accept()
 
+    agent_connection = ws
 
-    expected = (
-        f"Bearer {RELAY_TOKEN}"
-    )
-
-
-    if RELAY_TOKEN:
-
-        if auth != expected:
-
-            await websocket.close(
-                code=1008,
-                reason="Invalid token"
-            )
-
-            print(
-                "Rejected agent connection"
-            )
-
-            return
-
-
-
-    # -------------------------
-    # Accept
-    # -------------------------
-
-    await websocket.accept()
-
-
-    agent_connection = websocket
-
-
-    print(
-        "Agent connected"
-    )
-
+    print("Agent connected")
 
     try:
-
         while True:
+            msg = await ws.receive_text()
 
-            message = await websocket.receive_text()
+            data = json.loads(msg)
 
+            if data.get("type") == "response":
 
-            try:
+                request_id = data.get("id")
 
-                data = json.loads(
-                    message
-                )
-
-
-            except Exception:
-
-
-                print(
-                    "Invalid JSON:",
-                    message
-                )
-
-                continue
-
-
-
-            msg_type = data.get(
-                "type"
-            )
-
-
-            # ---------------------
-            # Heartbeat
-            # ---------------------
-
-            if msg_type == "heartbeat":
-
-
-                last_heartbeat = time.time()
-
-
-                await websocket.send(
-                    json.dumps(
-                        {
-                            "type":
-                                "heartbeat_ack",
-
-                            "timestamp":
-                                last_heartbeat
-                        }
-                    )
-                )
-
-
-                continue
-
-
-
-            # ---------------------
-            # Debug
-            # ---------------------
-
-            print(
-                "Agent message:",
-                data
-            )
-
-
+                if request_id in pending:
+                    pending[request_id].set_result(data)
 
     except WebSocketDisconnect:
-
-
-        print(
-            "Agent disconnected"
-        )
-
+        print("Agent disconnected")
 
     finally:
-
-        if agent_connection == websocket:
-
+        if agent_connection == ws:
             agent_connection = None
 
 
 
-# ============================
-# Future MCP Forwarding
-# ============================
-
-
 @app.post("/mcp")
-async def mcp_forward(
-    payload: dict
-):
-
+async def mcp_forward(payload: dict):
 
     if agent_connection is None:
-
-
         raise HTTPException(
             status_code=503,
             detail="Agent offline"
         )
 
+    request_id = str(uuid.uuid4())
 
-    request_id = (
-        str(time.time())
-    )
+    future = asyncio.get_event_loop().create_future()
 
-
-    message = {
-
-        "type":
-            "request",
-
-        "id":
-            request_id,
-
-        "payload":
-            payload
-    }
-
+    pending[request_id] = future
 
     await agent_connection.send_text(
-        json.dumps(message)
+        json.dumps({
+            "type":"request",
+            "id":request_id,
+            "payload":payload
+        })
     )
 
+    try:
+        result = await asyncio.wait_for(
+            future,
+            timeout=120
+        )
 
-    return {
+        return result["result"]
 
-        "status":
-            "sent",
+    except asyncio.TimeoutError:
 
-        "id":
-            request_id
-    }
+        raise HTTPException(
+            status_code=504,
+            detail="MCP timeout"
+        )
+
+    finally:
+        pending.pop(
+            request_id,
+            None
+        )
